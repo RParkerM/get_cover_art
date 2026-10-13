@@ -1,4 +1,4 @@
-import argparse, os
+import argparse, os, math
 from .cover_finder import CoverFinder, DEFAULTS
 
 # This script searches apple music for artwork that is missing from your library
@@ -21,8 +21,8 @@ def check_art_quality(value: str) -> float:
 
 def check_throttle(value: str) -> float:
     fvalue = float(value)
-    if fvalue < 0:
-        raise argparse.ArgumentTypeError("throtte cannot be negative")
+    if not math.isfinite(fvalue) or fvalue < 0:
+        raise argparse.ArgumentTypeError("delay must be finite and non-negative")
     return fvalue
 
 def get_args():
@@ -46,7 +46,8 @@ def get_args():
     parser_behavior.add_argument('--force', help="overwrite existing artwork", action='store_true')
     parser_behavior.add_argument('--verbose', help="print verbose logging", action='store_true')
     parser_behavior.add_argument('--no-skip', '--no_skip', help="don't skip previously-scanned files", action='store_true')
-    parser_behavior.add_argument('--throttle', type=check_throttle, help="number of seconds to wait", default=0)
+    parser_behavior.add_argument('--throttle', type=check_throttle, help="initial rate-limit backoff in seconds (default: 3)", default=DEFAULTS['throttle'])
+    parser_behavior.add_argument('--request-interval', type=check_throttle, help="minimum seconds between requests, including artwork downloads (default: 10)", default=DEFAULTS['request_interval'])
 
     parser_filters = parser.add_argument_group('filter options')
     parser_filters.add_argument('--skip-artwork', '--skip_artwork', help="(maintained between runs) file listing destination art files to skip", default=DEFAULTS.get('skip_artwork'))
@@ -67,6 +68,9 @@ def main():
     num_skipped = len(finder.files_skipped)
     num_failed = len(finder.files_failed)
     print(f"Done!  Processed: {num_processed}, Skipped: {num_skipped}, Failed: {num_failed}")
+    print(f"Albums: Downloaded: {len(finder.downloads)}, Skipped: {len(finder.albums_skipped)}, Failed: {len(finder.albums_failed)}")
+    if finder.stopped:
+        print("Stopped due to rate limiting. Downloaded artwork is preserved; rerun later to resume.")
     if not args.cleanup:
         if finder.art_folder_override:
             print(f"Artwork folder: {finder.art_folder_override}")

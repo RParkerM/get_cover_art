@@ -1,5 +1,8 @@
 import json
+import os
 import time
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from urllib.request import Request, urlopen, HTTPError
 from urllib.parse import urlparse, quote
 from typing import Tuple
@@ -11,29 +14,55 @@ QUERY_TEMPLATE = "https://itunes.apple.com/search?term=%s&media=music&entity=%s"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.55 Safari/537.36"
 THROTTLED_HTTP_CODES = [403, 429]
 
+class RateLimitError(Exception):
+    """The server rejected three consecutive requests; stop this run."""
+
 class AppleDownloader(object):
-    def __init__(self, verbose: bool, throttle: float, art_size: int, art_quality: int):
+    def __init__(self, verbose: bool, throttle: float, art_size: int, art_quality: int, request_interval: float = 10):
         quality_suffix = "bb" if art_quality == 0 else f"-{art_quality}"
         self.file_suffix = f"{art_size}x{art_size}{quality_suffix}"
         self.verbose = verbose
         self.throttle = throttle
+        self.request_interval = request_interval
+        self._last_request = None
+        self._rate_limits = 0
         self.artist_normalizer = ArtistNormalizer()
         self.album_normalizer = AlbumNormalizer()
         self.deromanizer = DeRomanizer()
         
     def _urlopen_safe(self, url: str) -> str:
         while True:
+            if self._last_request is not None:
+                delay = self.request_interval - (time.monotonic() - self._last_request)
+                if delay > 0:
+                    time.sleep(delay)
             try:
                 q = Request(url)
                 q.add_header("User-Agent", USER_AGENT)
-                response = urlopen(q)
-                return response.read()
+                self._last_request = time.monotonic()
+                with urlopen(q) as response:
+                    data = response.read()
+                self._rate_limits = 0
+                return data
             except HTTPError as e:
                 if e.code in THROTTLED_HTTP_CODES:
-                    # we've been throttled, time to sleep
+                    self._rate_limits += 1
+                    if self._rate_limits >= 3:
+                        raise RateLimitError("Stopped after three consecutive rate-limit responses") from e
+                    delay = self.throttle * (2 ** (self._rate_limits - 1))
+                    retry_after = e.headers.get('Retry-After') if e.headers else None
+                    if retry_after:
+                        try:
+                            retry_delay = float(retry_after)
+                        except ValueError:
+                            try:
+                                retry_delay = (parsedate_to_datetime(retry_after) - datetime.now(timezone.utc)).total_seconds()
+                            except (TypeError, ValueError, OverflowError):
+                                retry_delay = 0
+                        delay = max(delay, retry_delay)
                     domain = urlparse(url).netloc
-                    print(f"WARNING: Request limit exceeded from {domain}, trying again in {self.throttle} seconds...")
-                    time.sleep(self.throttle)
+                    print(f"WARNING: Request limit exceeded from {domain} ({self._rate_limits}/3), trying again in {delay} seconds...")
+                    time.sleep(delay)
                 else:
                     raise e
 
@@ -46,14 +75,20 @@ class AppleDownloader(object):
                 print("Please run 'Install Certificates.command' from your Python installation directory.")
             else:
                 print(f"ERROR: reading URL ({url}): {str(error)})")
-            return ""
+            raise
 
     def _download_from_url(self, image_url: str, dest_path: str):
         image_data = self._urlopen_safe(image_url)
         if self.verbose:
             print(f"Downloading from: {image_url}")
-        with open(dest_path,'wb') as file:
-            file.write(image_data)
+        temporary_path = dest_path + '.part'
+        try:
+            with open(temporary_path, 'wb') as file:
+                file.write(image_data)
+            os.replace(temporary_path, dest_path)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
         print(f"Downloaded cover art: {dest_path}")
 
     def _query(self, artist: str, album: str, title: str) -> dict:
@@ -67,11 +102,10 @@ class AppleDownloader(object):
         url = QUERY_TEMPLATE % (quote(query_term), entity)
         raw_json = self._urlopen_text(url)
         if raw_json:
-            try:
-                return json.loads(raw_json)
-            except Exception:
-                pass
-        return {}
+            info = json.loads(raw_json)
+            if isinstance(info, dict) and isinstance(info.get('resultCount'), int) and isinstance(info.get('results'), list):
+                return info
+        raise ValueError("Invalid Apple search response")
 
     def _get_data(self, meta: MetaAudio) -> Tuple[str, str, dict, bool]:
         artist = self.artist_normalizer.normalize(meta.artist)
@@ -113,6 +147,7 @@ class AppleDownloader(object):
             except Exception as error:
                 print(f"ERROR encountered when downloading for artist ({meta_artist}) and album ({meta_album})")
                 print(error)
+                raise
 
         if self.verbose:
             print(f"Failed to find matching artist ({meta_artist}) and album ({meta_album})")

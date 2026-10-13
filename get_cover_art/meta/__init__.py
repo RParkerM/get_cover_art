@@ -21,7 +21,7 @@ EXT_TO_CONSTRUCTOR = {
 
 def get_meta(path: str) -> Union[MetaAudio, None]:
   ext = path.split('.')[-1].lower()
-  constructor = EXT_TO_CONSTRUCTOR[ext]
+  constructor = EXT_TO_CONSTRUCTOR.get(ext)
   if constructor:
     return constructor(path)
   return None

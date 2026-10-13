@@ -81,7 +81,9 @@ behavior options:
   --force               process files regardless of existing artwork
   --verbose             print verbose logging
   --no-skip             don't skip previously-scanned files
-  --throttle THROTTLE   number of seconds to wait if request is rejected
+  --throttle THROTTLE   initial rate-limit backoff in seconds (default: 3)
+  --request-interval SECONDS
+                        minimum seconds between requests (default: 10)
 
 filter options:
   --skip-artwork SKIP_ARTWORK
@@ -94,6 +96,41 @@ filter options:
 if you omit `path`, it will scan the current working directory
 
 _Pro Tip:_ You can run with `--test` first, then browse/prune the downloaded artwork, then run again with `--no-download` to embed only the artwork you didn't prune.
+
+Requests (including artwork downloads and retries) are paced at least 10 seconds
+apart by default. `--request-interval` changes this minimum; `--throttle` keeps
+its existing role as the initial delay after a rejection. HTTP 429 and the
+existing 403 handling use exponential backoff, with `Retry-After` seconds or an
+HTTP date taking precedence when longer. Three consecutive rejections stop the
+scan; a successful response resets the count. Wait before rerunning a stopped
+scan. Pacing reduces request frequency but cannot guarantee avoiding limits.
+
+Downloaded images are reused across runs and written through a temporary file
+so a failed write does not replace an existing cover. Temporary network errors
+and invalid responses are reported as failures and are not saved as no matches.
+An album that fails temporarily is not requested again during the same scan.
+Only completed searches with no matching artwork enter the skip-artwork list.
+Existing images are usable even if an older run added them to that list. To retry
+old failures without a downloaded image, use `--no-skip`. Unsupported files such
+as PDF booklets are ignored silently. The final report includes file totals and
+unique artwork destinations downloaded, skipped, or failed.
+
+For a Windows copy, first download and review artwork:
+
+```powershell
+python -m get_cover_art --path "C:\Parker\Development\Music library copy\Music" --art-dest "C:\Parker\Development\Apple Music Covers\_cover_art" --test --request-interval 10
+```
+
+Rerun that command later if rate limiting stops it; existing covers are reused.
+After reviewing the covers, embed them without any network requests:
+
+```powershell
+python -m get_cover_art --path "C:\Parker\Development\Music library copy\Music" --art-dest "C:\Parker\Development\Apple Music Covers\_cover_art" --no-download
+```
+
+Run the automated tests with `python -m unittest discover -s tests -v` after
+installing the package dependencies. Tests mock HTTP and timing and do not
+contact Apple.
 
 ### From the Python Environment
 ```python
@@ -115,7 +152,7 @@ finder.scan_file(PATH_TO_AUDIO_FILE)
   - Step 1 is skipped if you specified a single file instead of a folder.
 2. For each file without embedded artwork (or all files if `--force` is used), attempts to download from Apple Music based on artist and album metadata.
   - Step 2 is skipped if it had already downloaded (or attempted to download) the image file.
-    - This works by caching a list of previously downloaded/attempted artwork (using `skip_artwork.txt`)
+    - Existing artwork files are reused; confirmed unmatched artwork is cached in `skip_artwork.txt` when that file exists.
     - You can ignore the cached list by using `--no-skip`
   - Step 2 is also skipped based on `--no-download` or other `--skip-*` options.
 3. If artwork is found, it's embedded into the audio file.

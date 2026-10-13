@@ -2,7 +2,7 @@ import os, unicodedata, re
 from pathlib import Path
 from typing import List, Union
 
-from .apple_downloader import AppleDownloader
+from .apple_downloader import AppleDownloader, RateLimitError
 from .meta import get_meta, MetaAudio
 
 DEFAULTS = {
@@ -16,6 +16,7 @@ DEFAULTS = {
     "external_art_filename": ['cover.jpg', '_albumcover.jpg', 'folder.jpg'],
     "art_dest_filename": "{artist} - {album_or_title}.jpg",
     "throttle": 3,
+    "request_interval": 10,
 }
 
 # utility class to cache a set of values
@@ -64,6 +65,10 @@ class CoverFinder(object):
         self.files_skipped = []   # no artwork was available / embeddable
         self.files_invalid = []   # not a unsupported audio file
         self.files_failed = []    # exception encountered
+        self.downloads = set()
+        self.albums_skipped = set()
+        self.albums_failed = set()
+        self.stopped = False
 
         self.art_folder_override = ""
         self.verbose = options.get('verbose')
@@ -71,8 +76,9 @@ class CoverFinder(object):
         self.external_art_mode = options.get('external_art_mode', None)
         self.external_art_filename = options.get('external_art_filename', None)
         if not options.get('no_download'):
-            throttle = float(options.get('throttle') or DEFAULTS.get('throttle'))
-            self.downloader = AppleDownloader(self.verbose, throttle, self.art_size, self.art_quality)
+            throttle = float(options.get('throttle', DEFAULTS['throttle']))
+            interval = float(options.get('request_interval', DEFAULTS['request_interval']))
+            self.downloader = AppleDownloader(self.verbose, throttle, self.art_size, self.art_quality, interval)
         if not options.get('art_dest_inline'):
             self.art_folder_override = options.get('art_dest')
             if self.art_folder_override:
@@ -97,7 +103,7 @@ class CoverFinder(object):
         if meta.has_embedded_art() and not self.clear:
             if verbose: print(f"Skipping existing embedded artwork for {art_path}")
             return True
-        if self.ignore_artwork.has(art_path):
+        if self.ignore_artwork.has(art_path) and not os.path.isfile(art_path):
             if verbose: print(f"Skipping ignored art path {art_path}")
             return True
         return False
@@ -122,7 +128,12 @@ class CoverFinder(object):
     
     def _download(self, meta: MetaAudio, art_path: str) -> bool:
         if self.force or not os.path.exists(art_path):
-            return self.downloader.download(meta, art_path)
+            success = self.downloader.download(meta, art_path)
+            if success:
+                self.downloads.add(art_path)
+            else:
+                self.ignore_artwork.add(art_path)
+            return success
         elif self.verbose:
             print(f"Skipping existing download for {art_path}")
         return True
@@ -149,6 +160,9 @@ class CoverFinder(object):
                     if self.verbose: print(f"Deleted folder: {folder}")
 
     def scan_file(self, path: str, allow_cleanup = True):
+        if self.stopped:
+            return
+        art_path = path
         art_folder = self.art_folder_override or os.path.split(path)[0]
         try:
             meta = get_meta(path)
@@ -156,7 +170,11 @@ class CoverFinder(object):
                 filename_no_ext = os.path.splitext(os.path.basename(path))[0]
                 filename = self._slugify(self.art_dest_filename.format(artist=meta.artist, album=meta.album, title=meta.title, album_or_title=meta.album or meta.title, filename=filename_no_ext))
                 art_path = os.path.join(art_folder, filename)
+                if art_path in self.albums_failed:
+                    self.files_failed.append(path)
+                    return
                 if self._should_skip(meta, art_path, self.verbose):
+                    self.albums_skipped.add(art_path)
                     self.files_skipped.append(path)
                     if self.cleanup:
                         if allow_cleanup:
@@ -214,7 +232,7 @@ class CoverFinder(object):
                 if success:
                     self.files_processed.append(path)
                 else:
-                    self.ignore_artwork.add(art_path)
+                    self.albums_skipped.add(art_path)
                     self.files_skipped.append(path)
             else:
                 self.files_invalid.append(path)
@@ -222,6 +240,9 @@ class CoverFinder(object):
         except Exception as e:
             print(f"ERROR: failed to process {path}, {type(e).__name__}: {str(e)}")
             self.files_failed.append(path)
+            self.albums_failed.add(art_path)
+            if isinstance(e, RateLimitError):
+                self.stopped = True
             
     def scan_folder(self, folder="."):
         self.files_to_delete = set([])
@@ -230,4 +251,6 @@ class CoverFinder(object):
             for f in sorted(files):
                 path = os.path.join(root, f)
                 self.scan_file(path, False)
+                if self.stopped:
+                    return
         self._cleanup(self.files_to_delete)
