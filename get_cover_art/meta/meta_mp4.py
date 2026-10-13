@@ -1,6 +1,7 @@
 from .meta_audio import MetaAudio
 from mutagen.mp4 import MP4
 from mutagen.m4a import M4ACover
+from ..catalog import catalog_id
 
 class MetaMP4(MetaAudio):
     def _get_tag(self, tag: str) -> str:
@@ -13,6 +14,9 @@ class MetaMP4(MetaAudio):
         self.artist = self._get_tag('aART') or self._get_tag('©ART') 
         self.album = self._get_tag('©alb')
         self.title = self._get_tag('©nam')
+        self.collection_id = catalog_id(self.audio.tags.get('plID'))
+        self.track_id = catalog_id(self.audio.tags.get('cnID'))
+        self.artist_id = catalog_id(self.audio.tags.get('atID'))
         if self.artist == "" or self.title == "":
             raise Exception("missing XMP tags")
     

@@ -290,6 +290,64 @@ downloaded; missing images are reported without any lookup or request. For an
 existing image under any filename, use `local_artwork`. CSV reports cover only
 affected tracks reached during the run; re-audit afterward to verify coverage.
 
+### Purchased catalog IDs first
+
+M4A metadata now exposes `plID` (collection), `cnID` (track), and `atID`
+(artist). For missing artwork, verified catalog identifiers take precedence
+over artist/title searches. A collection lookup is accepted only when the
+response is a collection with the exact requested `collectionId` and an
+artwork URL. Artist/title differences do not reject a verified purchased ID.
+Manual approvals still take precedence, existing artwork stays untouched,
+and cached images are reused before making requests. This also works in normal
+scans when purchased identifiers are present; files without them retain the
+existing text-search workflow.
+
+Before processing any tracks, the tool reads all supported audio files directly
+in each containing folder, including already covered tracks. A missing `plID`
+can inherit the folder's common ID only when album and preferred artist metadata
+are consistent and nonempty. Multiple distinct IDs are processed independently,
+with separate ID-specific images. Tracks without an assignable ID, or conflicting
+groups whose lookup cannot resolve, require manual review: neither a generic
+JPEG nor a title-search result is shared across those groups. Existing embedded
+artwork is never replaced while resolving IDs.
+With the optional track fallback enabled, an ID-less track in a conflicting
+folder can still use its own verified `cnID` and associated collection; it
+does not inherit another track's identifier or fall back to a shared text cover.
+
+Successful, empty, and failed lookup responses are cached by ID for the current
+run. Temporary failures are not persisted; restart later to retry. All lookups,
+fallback searches, and image downloads share the existing request pacing,
+backoff, and circuit breaker. ID-verified covers use `.apple-ID.jpg` filenames;
+text fallbacks use `.search.jpg` suffixes so they cannot later masquerade as
+verified covers when conflicts are discovered. Track-fallback images have a
+track-ID suffix. Existing generic covers can still be reused in folders without
+conflicting identifiers.
+
+If a `plID` no longer resolves, text matching remains the fallback in an
+unambiguous folder. Add `--track-id-fallback` to first try `cnID`: the returned
+track ID must match, then its associated collection gets a separate validated
+collection lookup. This optional step also works when only `cnID` is present.
+Temporary network errors and malformed responses are failures, not permission
+to issue further fallback requests.
+
+```powershell
+.\.venv\Scripts\python.exe -m get_cover_art --path "C:\Parker\Development\Music library copy\Music" --art-dest "C:\Parker\Development\Apple Music Covers\_cover_art" --missing-only --track-id-fallback --test --request-interval 5 --verbose --report artwork_recovery.csv
+```
+
+Review the covers, then apply them offline using the same fallback option:
+
+```powershell
+.\.venv\Scripts\python.exe -m get_cover_art --path "C:\Parker\Development\Music library copy\Music" --art-dest "C:\Parker\Development\Apple Music Covers\_cover_art" --missing-only --track-id-fallback --no-download --report artwork_recovery_offline.csv
+```
+
+The recovery CSV adds original `collection_id`, `track_id`, `artist_id`,
+`effective_collection_id`, `resolved_collection_id`, `id_conflict`,
+`lookup_method`, and `lookup_outcome`. Album summaries distinguish ID matches,
+text matches, local caches, and unresolved conflicts. `--no-download` never
+looks up identifiers; `--test` downloads without changing audio. Existing
+unsuccessful cache entries still apply to their destinations; use
+`--retry-unmatched` for explicit retries as before.
+
 ## How it works
 1. First, it recursively scans your provided folder for supported files.
   - Step 1 is skipped if you specified a single file instead of a folder.

@@ -37,6 +37,8 @@ def print_album_summaries(rows):
         print('  Queries: ' + ('; '.join(details(group, 'queries')) or 'none (local artwork, cache, or filter)'))
         candidates = details(group, 'candidates')
         print(f'  Candidates: {len(candidates)}')
+        methods = list(dict.fromkeys(f"{row.get('lookup_method', 'none')}: {row.get('lookup_outcome', '')}" for row in group))
+        print('  Lookup: ' + '; '.join(methods))
         for candidate in candidates:
             print(f"    {candidate.get('collectionName')} | {candidate.get('artistName')} | "
                   f"ID {candidate.get('collectionId')}: {candidate.get('reason')}")

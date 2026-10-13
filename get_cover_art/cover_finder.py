@@ -73,6 +73,7 @@ class CoverFinder(object):
         self.retry_unmatched = options.get('retry_unmatched', False)
         self.recovery_rows = []
         self.recovery_results = {}
+        self.catalog_plan = {}
         from .artwork_review import ManualOverrides
         self.manual_overrides = ManualOverrides(options.get('artwork_overrides'))
         if self.missing_only and (options.get('force') or options.get('clear') or options.get('cleanup') or options.get('no_skip')):
@@ -89,6 +90,8 @@ class CoverFinder(object):
             self.downloader = AppleDownloader(self.verbose, throttle, self.art_size, self.art_quality, interval)
             self.downloader.strict_matching = self.missing_only
             self.downloader.album_title_fallback = options.get('album_title_fallback', False)
+            self.downloader.track_id_fallback = options.get('track_id_fallback', False)
+        self.track_id_fallback = options.get('track_id_fallback', False)
         if not options.get('art_dest_inline'):
             self.art_folder_override = options.get('art_dest')
             if self.art_folder_override:
@@ -172,7 +175,11 @@ class CoverFinder(object):
     def scan_file(self, path: str, allow_cleanup = True):
         if self.stopped:
             return
-        if self.missing_only:
+        absolute_path = os.path.abspath(path)
+        if os.path.isfile(path) and absolute_path not in self.catalog_plan:
+            self._prepare_catalog_folder(os.path.dirname(absolute_path))
+        context = self.catalog_plan.get(absolute_path, {})
+        if self.missing_only or context.get('collection_id') or context.get('unresolved') or (self.track_id_fallback and context.get('track_id')):
             start = len(self.recovery_rows)
             self._recover_file(path)
             if allow_cleanup:
@@ -266,6 +273,7 @@ class CoverFinder(object):
         if self.verbose: print(f"Scanning folder: {folder}")
         for root, dirs, files in os.walk(folder):
             start = len(self.recovery_rows)
+            self._prepare_catalog_folder(root)
             try:
                 for f in sorted(files):
                     path = os.path.join(root, f)
@@ -273,10 +281,19 @@ class CoverFinder(object):
                     if self.stopped:
                         return
             finally:
-                if self.missing_only:
+                if len(self.recovery_rows) > start:
                     from .artwork_review import print_album_summaries
                     print_album_summaries(self.recovery_rows[start:])
         self._cleanup(self.files_to_delete)
+
+    def _prepare_catalog_folder(self, folder):
+        from .artwork_audit import inspect_artwork
+        from .catalog import folder_catalog_plan
+        from .meta import EXT_TO_CONSTRUCTOR
+        rows = [inspect_artwork(os.path.join(folder, name)) for name in sorted(os.listdir(folder))
+                if os.path.isfile(os.path.join(folder, name)) and
+                os.path.splitext(name)[1][1:].lower() in EXT_TO_CONSTRUCTOR]
+        self.catalog_plan.update(folder_catalog_plan(rows))
 
     def _recover_file(self, path):
         from .artwork_audit import inspect_artwork, validate_image
@@ -290,6 +307,9 @@ class CoverFinder(object):
             return
         self.recovery_rows.append(row)
         row.update(local_cover='', local_cover_available=False, queries='[]', candidates='[]')
+        context = self.catalog_plan.get(os.path.abspath(path), {})
+        row.update(effective_collection_id=context.get('collection_id'), id_conflict=context.get('id_conflict', ''),
+                   lookup_method='none', lookup_outcome='not requested')
         art_path = path
         try:
             if row['status'] != 'missing':
@@ -298,6 +318,9 @@ class CoverFinder(object):
                 self.files_failed.append(path)
                 return
             meta = get_meta(path)
+            meta.effective_collection_id = context.get('collection_id')
+            meta.track_id = context.get('track_id')
+            meta.catalog_conflict = bool(context.get('separate') or context.get('unresolved'))
             folder = self.art_folder_override or os.path.dirname(path)
             filename = self._slugify(self.art_dest_filename.format(
                 artist=meta.artist, album=meta.album, title=meta.title,
@@ -307,6 +330,28 @@ class CoverFinder(object):
             approval = self.manual_overrides.find(row)
             if approval:
                 art_path = self.manual_overrides.cover_path(approval, art_path)
+            elif context.get('unresolved') and not (self.track_id_fallback and context.get('track_id')):
+                row.update(status='manual_review', reason=context['id_conflict'], lookup_outcome='unresolved folder conflict')
+                self.files_skipped.append(path)
+                self.albums_skipped.add(path)
+                return
+            elif context.get('collection_id') or (self.track_id_fallback and context.get('track_id')):
+                from .catalog import catalog_cover_path
+                # Conflicting IDs never share the old filename, even when a JPEG exists there.
+                if context.get('separate') or not os.path.isfile(art_path):
+                    art_path = catalog_cover_path(art_path, context.get('collection_id'), context.get('track_id'))
+                    if not os.path.isfile(art_path):
+                        stem, extension = os.path.splitext(art_path)
+                        alternatives = []
+                        if self.track_id_fallback and context.get('track_id'):
+                            alternatives.append(stem + '.track-' + context['track_id'] + extension)
+                        if not context.get('separate'):
+                            alternatives.append(stem + '.search' + extension)
+                        art_path = next((candidate for candidate in alternatives if os.path.isfile(candidate)), art_path)
+                row['lookup_method'] = ('cached_text_match' if '.search.' in art_path else
+                                        'cached_track_id' if '.track-' in art_path else
+                                        'cached_collection_id' if '.apple-' in art_path else 'local_cache')
+                row['lookup_outcome'] = 'cached cover available' if os.path.isfile(art_path) else 'not requested'
             row.update(local_cover=art_path, local_cover_available=os.path.isfile(art_path))
             reason = ''
             if self.ignore_artists.has(meta.artist):
@@ -331,8 +376,13 @@ class CoverFinder(object):
                     finally:
                         diagnostics = self.downloader.diagnostics
                         row.update(queries=json.dumps(diagnostics.get('queries', [])),
-                                   candidates=json.dumps(diagnostics.get('candidates', [])))
+                                   candidates=json.dumps(diagnostics.get('candidates', [])),
+                                   lookup_method=diagnostics.get('lookup_method', 'none'),
+                                   lookup_outcome=diagnostics.get('lookup_outcome', 'request failed'),
+                                   resolved_collection_id=diagnostics.get('resolved_collection_id', ''))
                     if success:
+                        art_path = diagnostics.get('downloaded_path', art_path)
+                        row.update(local_cover=art_path, local_cover_available=os.path.isfile(art_path))
                         self.downloads.add(art_path)
                     else:
                         row.update(status=diagnostics['status'], reason=diagnostics['reason'])
@@ -362,9 +412,12 @@ class CoverFinder(object):
                     self.albums_skipped.add(art_path)
         except Exception as error:
             row.update(status='failed', reason=f'{type(error).__name__}: {error}')
+            row['lookup_outcome'] = 'request or processing failed'
             self.files_failed.append(path)
             self.albums_failed.add(art_path)
             if isinstance(error, RateLimitError):
                 self.stopped = True
         finally:
-            self.recovery_results[art_path] = {key: row.get(key, '') for key in ('status', 'reason', 'queries', 'candidates')}
+            self.recovery_results[art_path] = {key: row.get(key, '') for key in
+                                             ('status', 'reason', 'queries', 'candidates', 'lookup_method',
+                                              'lookup_outcome', 'resolved_collection_id')}

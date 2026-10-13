@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import wave
 from unittest.mock import patch
+from types import SimpleNamespace
 from urllib.error import HTTPError, URLError
 
 from PIL import Image
@@ -16,6 +17,8 @@ from get_cover_art.artwork_audit import audit_artwork, inspect_artwork
 from get_cover_art.cover_finder import CoverFinder
 from get_cover_art.__main__ import main
 from get_cover_art.artwork_review import ManualOverrides, write_candidates
+from get_cover_art.catalog import catalog_id
+from get_cover_art.meta.meta_mp4 import MetaMP4
 
 
 class RecoveryTests(unittest.TestCase):
@@ -407,6 +410,254 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual(len(list(csv.DictReader(source))), 2)
         with open(candidates, encoding='utf-8-sig', newline='') as source:
             self.assertEqual(len(list(csv.DictReader(source))), 1)
+
+    def purchased_ids(self, mapping):
+        # Real temporary audio/embedding, with purchased M4A atoms supplied by the reader.
+        def reader(path):
+            row = inspect_artwork(path)
+            collection, track = mapping.get(os.path.abspath(path), (None, None))
+            row.update(collection_id=collection, track_id=track)
+            return row
+        replacement = patch('get_cover_art.artwork_audit.inspect_artwork', side_effect=reader)
+        replacement.start()
+        self.addCleanup(replacement.stop)
+
+    def collection(self, identity=80456435):
+        item = self.candidate('Catalog Title', 'Catalog Artist', identity)
+        item['wrapperType'] = 'collection'
+        return item
+
+    def test_mutagen_mp4_catalog_id_extraction(self):
+        from mutagen.mp4 import MP4Tags
+        tags = MP4Tags()
+        tags.update({'plID': [80456435], 'cnID': [80456329], 'atID': [80456331],
+                     '©ART': ['Artist'], '©alb': ['Album'], '©nam': ['Track']})
+        with patch('get_cover_art.meta.meta_mp4.MP4', return_value=SimpleNamespace(tags=tags)):
+            meta = MetaMP4('purchased.m4a')
+        self.assertEqual(meta.collection_id, '80456435')
+        self.assertEqual(meta.track_id, '80456329')
+        self.assertEqual(meta.artist_id, '80456331')
+        for invalid in ([], [1, 2], -1, 0, True, 'bad'):
+            self.assertIsNone(catalog_id(invalid))
+
+    def test_consistent_catalog_ids_lookup_once_before_text(self):
+        paths = [self.track('Local Title', name) for name in ('one', 'two')]
+        self.purchased_ids({path: ('80456435', '80456329') for path in paths})
+        self.http.side_effect = [self.response([self.collection()]), io.BytesIO(self.jpeg)]
+        finder = self.finder()
+        finder.scan_folder(self.root)
+        self.assertEqual(self.http.call_count, 2)
+        self.assertIn('lookup?id=80456435', self.http.call_args_list[0].args[0].full_url)
+        self.assertTrue(all(inspect_artwork(path)['status'] == 'embedded' for path in paths))
+        self.assertEqual(finder.recovery_rows[0]['lookup_method'], 'collection_id')
+        self.assertEqual(finder.recovery_rows[0]['lookup_outcome'], 'resolved')
+
+    def test_missing_id_inherits_consistent_id_including_already_covered_track(self):
+        covered = self.track('Show', 'one', self.jpeg)
+        missing = self.track('Show', 'two')
+        original = self.digest(covered)
+        self.purchased_ids({covered: ('42', '101')})
+        self.http.side_effect = [self.response([self.collection(42)]), io.BytesIO(self.jpeg)]
+        finder = self.finder()
+        finder.scan_folder(self.root)
+        self.assertEqual(self.digest(covered), original)
+        self.assertEqual(inspect_artwork(missing)['status'], 'embedded')
+        self.assertEqual(finder.recovery_rows[0]['effective_collection_id'], '42')
+
+    def test_inconsistent_metadata_does_not_inherit_id(self):
+        known = self.track('Show', 'one', self.jpeg)
+        missing = self.track('Show', 'two')
+        audio = WAVE(missing)
+        audio.tags.add(TALB(text=['Different Edition']))
+        audio.save()
+        self.purchased_ids({known: ('42', '101')})
+        finder = self.finder()
+        finder.scan_folder(self.root)
+        self.http.assert_not_called()
+        self.assertEqual(finder.recovery_rows[0]['status'], 'manual_review')
+        self.assertIn('inconsistent', finder.recovery_rows[0]['id_conflict'])
+
+    def test_conflicting_ids_have_separate_verified_covers_idless_track_needs_review(self):
+        paths = [self.track('Show', name) for name in ('one', 'two', 'three')]
+        self.purchased_ids({paths[0]: ('42', '101'), paths[1]: ('43', '102')})
+        self.cover('Show')  # A generic JPEG must not cross the conflicting ID groups.
+        other = io.BytesIO()
+        Image.new('RGB', (4, 4), 'red').save(other, 'JPEG')
+        self.http.side_effect = [self.response([self.collection(42)]), io.BytesIO(self.jpeg),
+                                 self.response([self.collection(43)]), io.BytesIO(other.getvalue())]
+        finder = self.finder()
+        finder.scan_folder(self.root)
+        self.assertEqual(self.http.call_count, 4)
+        self.assertEqual(inspect_artwork(paths[0])['status'], 'embedded')
+        self.assertEqual(inspect_artwork(paths[1])['status'], 'embedded')
+        self.assertNotEqual(WAVE(paths[0]).tags.getall('APIC')[0].data, WAVE(paths[1]).tags.getall('APIC')[0].data)
+        self.assertEqual(inspect_artwork(paths[2])['status'], 'missing')
+        self.assertTrue(any(row['status'] == 'manual_review' and row['id_conflict'] for row in finder.recovery_rows))
+
+    def test_unresolved_conflicting_id_does_not_text_search(self):
+        first = self.track('Show', 'one')
+        second = self.track('Show', 'two', self.jpeg)
+        self.purchased_ids({first: ('42', None), second: ('43', None)})
+        before = self.digest(second)
+        self.http.side_effect = [self.response([])]
+        finder = self.finder()
+        finder.scan_folder(self.root)
+        self.assertEqual(self.http.call_count, 1)
+        self.assertEqual(finder.recovery_rows[0]['status'], 'manual_review')
+        self.assertEqual(self.digest(second), before)
+
+    def test_wrong_collection_wrapper_or_id_falls_back_to_text(self):
+        path = self.track('Show', 'one')
+        self.purchased_ids({path: ('42', None)})
+        wrong = self.collection(43)
+        self.http.side_effect = [self.response([wrong]), self.response([self.candidate('Show')]), io.BytesIO(self.jpeg)]
+        finder = self.finder()
+        finder.scan_file(path)
+        self.assertEqual(finder.recovery_rows[0]['lookup_method'], 'title_artist_search')
+        self.assertIn('collection unavailable', finder.recovery_rows[0]['lookup_outcome'])
+        self.assertIn('text match', finder.recovery_rows[0]['lookup_outcome'])
+        self.assertEqual(self.http.call_count, 3)
+
+    def test_optional_track_lookup_validates_associated_collection(self):
+        path = self.track('Show', 'one')
+        self.purchased_ids({path: ('42', '101')})
+        track = dict(wrapperType='track', trackId=101, collectionId=43)
+        self.http.side_effect = [self.response([]), self.response([track]),
+                                 self.response([self.collection(43)]), io.BytesIO(self.jpeg)]
+        finder = self.finder(track_id_fallback=True)
+        finder.scan_file(path)
+        row = finder.recovery_rows[0]
+        self.assertEqual(row['lookup_method'], 'track_id')
+        self.assertEqual(row['resolved_collection_id'], '43')
+        self.assertEqual(self.http.call_count, 4)
+
+    def test_catalog_test_mode_then_offline_embedding(self):
+        path = self.track('Show', 'one')
+        self.purchased_ids({path: ('42', None)})
+        before = self.digest(path)
+        self.http.side_effect = [self.response([self.collection(42)]), io.BytesIO(self.jpeg)]
+        finder = self.finder(test=True)
+        finder.scan_file(path)
+        self.assertEqual(self.digest(path), before)
+        self.http.reset_mock()
+        offline = self.finder(no_download=True)
+        offline.scan_file(path)
+        self.http.assert_not_called()
+        self.assertEqual(inspect_artwork(path)['status'], 'embedded')
+
+    def test_catalog_lookup_failure_keeps_cache_retryable_and_stops_on_limits(self):
+        path = self.track('Show', 'one')
+        self.purchased_ids({path: ('42', None)})
+        self.http.side_effect = [HTTPError('https://itunes.apple.com/lookup', 429, 'limited', {}, None) for _ in range(3)]
+        finder = self.finder()
+        finder.scan_file(path)
+        self.assertTrue(finder.stopped)
+        self.assertEqual(self.http.call_count, 3)
+        self.assertFalse(finder.ignore_artwork.has(finder.recovery_rows[0]['local_cover']))
+
+    def test_lookup_cache_shared_between_folders(self):
+        first = self.track('First Local Title', 'one')
+        second = self.track('Second Local Title', 'one')
+        self.purchased_ids({first: ('42', None), second: ('42', None)})
+        self.http.side_effect = [self.response([self.collection(42)]), io.BytesIO(self.jpeg), io.BytesIO(self.jpeg)]
+        finder = self.finder()
+        finder.scan_folder(self.root)
+        urls = [call.args[0].full_url for call in self.http.call_args_list]
+        self.assertEqual(sum('/lookup?' in url for url in urls), 1)
+
+    def test_default_scan_also_uses_catalog_id(self):
+        path = self.track('Show', 'one')
+        self.purchased_ids({path: ('42', None)})
+        self.http.side_effect = [self.response([self.collection(42)]), io.BytesIO(self.jpeg)]
+        finder = CoverFinder(dict(art_dest=self.root, request_interval=0))
+        finder.scan_file(path)
+        self.assertEqual(finder.recovery_rows[0]['lookup_method'], 'collection_id')
+        self.assertEqual(inspect_artwork(path)['status'], 'embedded')
+
+    def test_lookup_collection_requires_collection_wrapper(self):
+        path = self.track('Show', 'one')
+        self.purchased_ids({path: ('42', None)})
+        item = self.collection(42)
+        item['wrapperType'] = 'track'
+        self.http.side_effect = [self.response([item]), self.response([])]
+        finder = self.finder()
+        finder.scan_file(path)
+        self.assertEqual(inspect_artwork(path)['status'], 'missing')
+        self.assertEqual(finder.recovery_rows[0]['lookup_method'], 'title_artist_search')
+        self.assertEqual(finder.recovery_rows[0]['status'], 'no_match')
+
+    def test_cached_text_fallback_does_not_become_verified_conflict_cover(self):
+        first = self.track('Show', 'one')
+        self.purchased_ids({first: ('42', None)})
+        self.http.side_effect = [self.response([]), self.response([self.candidate('Show')]), io.BytesIO(self.jpeg)]
+        finder = self.finder(test=True)
+        finder.scan_file(first)
+        self.assertIn('.search.jpg', finder.recovery_rows[0]['local_cover'])
+        second = self.track('Show', 'two', self.jpeg)
+        self.purchased_ids({first: ('42', None), second: ('43', None)})
+        # Later discovery of a conflicting ID must exclude the earlier text-only cover.
+        self.http.reset_mock()
+        self.http.side_effect = [self.response([])]
+        resumed = self.finder()
+        resumed.scan_folder(self.root)
+        self.assertEqual(self.http.call_count, 1)
+        self.assertEqual(resumed.recovery_rows[0]['status'], 'manual_review')
+        self.assertEqual(inspect_artwork(first)['status'], 'missing')
+
+    def test_negative_and_temporary_lookups_are_cached_only_for_run(self):
+        from get_cover_art.apple_downloader import AppleDownloader
+        downloader = AppleDownloader(False, 3, 500, 0, 0)
+        self.http.side_effect = [self.response([])]
+        self.assertIsNone(downloader._lookup_collection('42'))
+        self.assertIsNone(downloader._lookup_collection('42'))
+        self.assertEqual(self.http.call_count, 1)
+        self.http.reset_mock()
+        self.http.side_effect = [URLError('offline')]
+        for _ in range(2):
+            with self.assertRaises(URLError):
+                downloader._lookup_collection('43')
+        self.assertEqual(self.http.call_count, 1)
+        self.assertEqual(AppleDownloader(False, 3, 500, 0).lookup_cache, {})
+
+    def test_track_lookup_rejects_wrong_track_id(self):
+        path = self.track('Show', 'one')
+        self.purchased_ids({path: ('42', '101')})
+        self.http.side_effect = [self.response([]), self.response([dict(wrapperType='track', trackId=102, collectionId=43)]),
+                                 self.response([])]
+        finder = self.finder(track_id_fallback=True)
+        finder.scan_file(path)
+        self.assertEqual(finder.recovery_rows[0]['lookup_method'], 'title_artist_search')
+        self.assertEqual(inspect_artwork(path)['status'], 'missing')
+        self.assertFalse(any('id=43' in call.args[0].full_url for call in self.http.call_args_list))
+
+    def test_recovery_report_contains_catalog_diagnostics(self):
+        path = self.track('Show', 'one')
+        self.purchased_ids({path: ('42', None)})
+        self.http.side_effect = [self.response([self.collection(42)]), io.BytesIO(self.jpeg)]
+        report = os.path.join(self.root, 'recovery.csv')
+        candidates = os.path.join(self.root, 'candidates.csv')
+        with patch('sys.argv', ['get_cover_art', '--path', self.root, '--art-dest', self.root, '--missing-only',
+                               '--report', report, '--candidate-report', candidates]):
+            main()
+        with open(report, encoding='utf-8-sig', newline='') as source:
+            row = next(csv.DictReader(source))
+        self.assertEqual(row['effective_collection_id'], '42')
+        self.assertEqual(row['resolved_collection_id'], '42')
+        self.assertEqual(row['lookup_method'], 'collection_id')
+        self.assertEqual(row['lookup_outcome'], 'resolved')
+
+    def test_idless_conflicting_track_can_use_its_own_verified_track_id(self):
+        first = self.track('Show', 'one', self.jpeg)
+        second = self.track('Show', 'two', self.jpeg)
+        missing = self.track('Show', 'three')
+        self.purchased_ids({first: ('42', None), second: ('43', None), missing: (None, '101')})
+        self.http.side_effect = [self.response([dict(wrapperType='track', trackId=101, collectionId=43)]),
+                                 self.response([self.collection(43)]), io.BytesIO(self.jpeg)]
+        finder = self.finder(track_id_fallback=True)
+        finder.scan_folder(self.root)
+        self.assertEqual(inspect_artwork(missing)['status'], 'embedded')
+        self.assertEqual(finder.recovery_rows[0]['lookup_method'], 'track_id')
+        self.assertEqual(finder.recovery_rows[0]['resolved_collection_id'], '43')
 
 
 if __name__ == '__main__':

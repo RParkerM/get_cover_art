@@ -9,6 +9,7 @@ from mutagen import File
 from mutagen.flac import Picture
 from PIL import Image
 from .meta import EXT_TO_CONSTRUCTOR
+from .catalog import catalog_id
 
 
 def audio_paths(path):
@@ -37,6 +38,8 @@ def inspect_artwork(path):
         if audio is None:
             raise ValueError('Unrecognized audio data')
         tags = audio.tags or {}
+        row.update(collection_id=catalog_id(tags.get('plID')), track_id=catalog_id(tags.get('cnID')),
+                   artist_id=catalog_id(tags.get('atID')))
         def tag(*names):
             for name in names:
                 value = tags.get(name)
@@ -73,7 +76,9 @@ def inspect_artwork(path):
 def write_report(rows, destination):
     fields = ['path', 'folder', 'album', 'album_artist', 'track_artist', 'title', 'status',
               'reason', 'folder_total', 'folder_embedded', 'folder_missing', 'folder_invalid',
-              'local_cover', 'local_cover_available', 'queries', 'candidates']
+              'local_cover', 'local_cover_available', 'queries', 'candidates',
+              'collection_id', 'track_id', 'artist_id', 'effective_collection_id', 'id_conflict',
+              'lookup_method', 'lookup_outcome', 'resolved_collection_id']
     with open(destination, 'w', encoding='utf-8-sig', newline='') as output:
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction='ignore')
         writer.writeheader()

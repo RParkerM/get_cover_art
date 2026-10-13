@@ -55,6 +55,7 @@ def get_args():
     parser_behavior.add_argument('--report', help='CSV destination (default: artwork_audit.csv or artwork_recovery.csv)')
     parser_behavior.add_argument('--candidate-report', help='candidate review CSV (default: artwork_candidates.csv with missing-only)')
     parser_behavior.add_argument('--artwork-overrides', help='manual approval CSV for missing-only recovery')
+    parser_behavior.add_argument('--track-id-fallback', action='store_true', help='try purchased cnID and validate its collection when plID lookup is unavailable')
 
     parser_filters = parser.add_argument_group('filter options')
     parser_filters.add_argument('--skip-artwork', '--skip_artwork', help="(maintained between runs) file listing destination art files to skip", default=DEFAULTS.get('skip_artwork'))
