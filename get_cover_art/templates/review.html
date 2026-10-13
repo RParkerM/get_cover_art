@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="review-token" content="{{ token }}"><title>Artwork review</title><link rel="stylesheet" href="/static/review.css"><script defer src="/static/review.js"></script></head>
+<body><header><h1>Artwork review</h1><p>Inspect covers. Save decisions. Preview every change.</p><button id="refresh">Rescan library & reports</button></header><div id="summary"></div><p id="message" role="status"></p><details><summary>Report warnings & stale approvals</summary><pre id="warnings"></pre></details>
+<main><aside><input id="query" type="search" placeholder="Search albums, artists or folders" aria-label="Search albums"><select id="filter" aria-label="Filter albums"><option value="all">All albums</option><option value="unreviewed" selected>Unreviewed</option><option value="approved">Approved</option><option value="skipped">Skipped</option><option value="unresolved">Unresolved</option><option value="no_candidates">No candidates</option><option value="conflict">Conflicting Apple IDs</option><option value="partial">Partially covered</option></select><div id="albums"></div><button id="preview-all">Preview all approved</button><button id="apply-all">Apply all approved</button></aside>
+<section id="detail"><p>Select an album to inspect its artwork.</p></section></main>
+<section id="progress"><h2>Proposed changes & results</h2><p id="job-status"></p><div id="results"></div></section>
+<dialog id="large-preview"><button id="close-preview">Close preview</button><img id="large-image" alt="Selected artwork"></dialog>
+</body></html>

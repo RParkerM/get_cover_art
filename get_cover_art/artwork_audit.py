@@ -51,6 +51,8 @@ def inspect_artwork(path):
         row.update(album=tag('©alb', 'TALB', 'album'), title=tag('©nam', 'TIT2', 'title'),
                    album_artist=tag('aART', 'TPE2', 'albumartist'),
                    track_artist=tag('©ART', 'TPE1', 'artist'))
+        number = tags.get('trkn')
+        row['track_number'] = str(number[0][0]) if number else tag('TRCK', 'tracknumber')
         pictures = list(tags.get('covr', []))
         if hasattr(tags, 'getall'):
             pictures.extend(frame.data for frame in tags.getall('APIC'))

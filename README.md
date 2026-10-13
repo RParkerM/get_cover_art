@@ -412,3 +412,40 @@ Step 6 will take a while.
 
 ### The artwork appears in Apple's Music App but not my iOS device.
 You'll have to unsync all your music and re-sync it again.  Try it with a single file first.
+
+## Local artwork review interface
+
+Install the checkout (Flask, Pillow and Mutagen are installed automatically):
+
+```powershell
+py -m pip install -e .
+py -m get_cover_art --review-artwork --path "D:\Music" --reports-dir "D:\ArtworkReports" --art-dest "D:\CoverCache"
+```
+
+Use the same library and `--art-dest` as previous recovery runs. The server binds exclusively to `127.0.0.1`, chooses an available port, prints the URL, and opens your default browser. `--port 8765` requests a specific port; `--no-browser` suppresses browser launch. Ctrl+C stops the server; an active embedding worker finishes its current operation. No audio is modified and no Apple requests are made at launch. Scanning reads the library locally, so a large library may take time before the URL appears. Debug mode and the interactive debugger are disabled.
+
+The review reads CSVs in `--reports-dir` by their actual columns, including audit reports such as `artwork_audit_after.csv`, candidate reports, and recovery reports. Filenames can differ. To select reports explicitly, pass `--report` and/or `--candidate-report` (when either is supplied, only those files are loaded). The local library scan is authoritative because audit reports omit tracks already containing covers. Recovery candidate JSON, rejection diagnostics, local cover paths, and existing collection-ID cache filenames are reused. Missing and malformed reports produce warnings. The dashboard identifies missing report tracks and approvals whose groups disappeared. Click **Rescan library & reports** after changing files or generating new reports.
+
+Select an album, inspect its track list and any existing embedded cover, and review the candidate gallery. Cached covers are displayed offline. **Fetch cover** explicitly downloads an uncached Apple cover through the existing paced downloader, backoff and circuit breaker. Missing URLs require **Search Apple** with a collection ID, track ID, or edited album/artist query; the interface never invents an artwork URL. Search runs only when you press the button, and results are cached in the persistent review state. A verified collection ID is ranked ahead of title similarities, but every candidate still needs manual approval. `--request-interval`, `--throttle`, `--art-size`, and `--art-quality` retain their existing meanings. `--no-download` disables searches and downloads while keeping local review available.
+
+1. Select a cover and use **Large preview** to inspect it. Alternatively, choose a local image through the file picker. Uploads accept verified JPEG/PNG content, at most 12 MB and 25 million pixels. A JPEG copy at quality 95, capped at 3000 pixels per side, is cached automatically; transparent PNGs receive a white background.
+2. Check the exact target tracks and press **Save approval**. Approval does not embed artwork. Use **Skip album**, **Mark unresolved**, or **Revoke approval** to change a decision; saving a different cover replaces the prior selection.
+3. Use **Dry run / preview** (or **Preview all approved**) to see per-track proposed outcomes. Fetch remote covers first so the preview and apply can use validated cached bytes without network requests.
+4. Use **Apply selected album** or **Apply all approved** and confirm the action. Progress and individual successes, existing-cover skips, stale approvals, and failures appear below. Repeated applications preserve existing covers. Replacement requires checking **Explicitly replace existing artwork** for the selected group and confirming it; bulk apply always preserves existing covers.
+
+Approvals and search/upload candidates live in `artwork_review.json` under `--reports-dir`; cached images live in `--art-dest`. Keep both for recovery. Group identities include the folder, collection identity or local album metadata, and track identifiers, rather than only the folder name. Approvals store their exact target tracks, metadata, file size, modification time and filesystem identity. Changed, moved, missing or unreadable files are detected before writes. Stale approvals must be reviewed again. A damaged approval JSON stops startup rather than silently discarding decisions. An OS advisory lock in the system temporary directory prevents two review servers from opening the same library. Locks release when the process exits, including after a crash; the tiny lock file is retained to avoid inode races. Within the server, overlapping apply operations and approval changes during writes are rejected.
+
+Conflicting `plID` values are shown prominently and split into separate collection groups, each with its own approval. Tracks without IDs inherit an ID only when the folder has one collection ID and consistent album/artist metadata. Otherwise they form separate metadata groups, with targets initially unchecked when the folder has IDs. You must explicitly select those tracks; a group's approval cannot target another group's tracks. No approved cover crosses a conflicting collection boundary automatically.
+
+Before every write, the service reinspects the track, checks its fingerprint and access permissions, preserves any existing cover by default (including invalid embedded art), and validates the image. It copies the audio to a temporary file alongside the original, calls the existing format-specific metadata writer, verifies the resulting embedded image, then atomically replaces that individual file. Failed writes leave the original intact and processing continues for other tracks. The collection is never removed. This requires free space for one additional audio file and write permission on its folder. Approvals updated by this server record the new post-write fingerprint, so its own successful writes do not make approvals stale. The approach minimizes partial-file writes but is not a backup or a guarantee against power loss, filesystem failures, or simultaneous modifications by another program during the final replace. File replacement may change filesystem-specific attributes or hard-link relationships. Close other metadata editors and retain a backup for irreplaceable files.
+
+HTTP access uses generated group/track/candidate IDs; it cannot request arbitrary filesystem paths. State-changing endpoints require a random session token and reject cross-origin requests. Metadata is rendered as text, uploads ignore client filenames, and only approved Apple image hosts are fetched. The interface uses plain HTML/CSS/JavaScript and requires no frontend build tooling. Older supported Python installations receive compatible Flask dependency releases through pip; Python 3.12 is the tested runtime for this feature.
+
+Rerun the existing read-only audit afterward:
+
+```powershell
+py -m get_cover_art --audit-artwork --path "D:\Music" --report "D:\ArtworkReports\artwork_audit_after.csv"
+py -m unittest discover -s tests
+```
+
+The audit prints total, embedded, missing, invalid and unreadable counts. Its CSV contains affected files only. Tests use temporary music libraries and mocked Apple responses; they never query the live catalog.

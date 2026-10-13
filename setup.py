@@ -24,7 +24,10 @@ setuptools.setup(
     license = 'MIT',
     keywords = 'cover album art artwork embed itunes apple music mp3 id3 m4a m4b mp4 aac xmp flac dsf ogg vorbis opus wav songs',
     packages = setuptools.find_packages(),
+    package_data = {'get_cover_art': ['templates/*.html', 'static/*.css', 'static/*.js']},
     install_requires = [
+        'Flask', # localhost artwork review; pip selects a version compatible with Python
+
         'mutagen',
         'Pillow', # validate embedded and cached artwork during audit/recovery
     ],

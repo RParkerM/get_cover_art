@@ -48,6 +48,10 @@ def get_args():
     parser_behavior.add_argument('--no-skip', '--no_skip', help="don't skip previously-scanned files", action='store_true')
     parser_behavior.add_argument('--throttle', type=check_throttle, help="initial rate-limit backoff in seconds (default: 3)", default=DEFAULTS['throttle'])
     parser_behavior.add_argument('--request-interval', type=check_throttle, help="minimum seconds between requests, including artwork downloads (default: 10)", default=DEFAULTS['request_interval'])
+    parser_behavior.add_argument('--review-artwork', action='store_true', help='launch the local manual artwork review interface')
+    parser_behavior.add_argument('--reports-dir', default='.', help='review CSV reports and persistent approvals directory')
+    parser_behavior.add_argument('--port', type=int, default=0, help='loopback review port (default: choose an available port)')
+    parser_behavior.add_argument('--no-browser', action='store_true', help='print review URL without opening the browser')
     parser_behavior.add_argument('--audit-artwork', action='store_true', help='read-only embedded artwork audit; no requests or audio changes')
     parser_behavior.add_argument('--missing-only', action='store_true', help='recover only tracks without embedded artwork; preserve caches and existing art')
     parser_behavior.add_argument('--retry-unmatched', action='store_true', help='with missing-only, explicitly retry cached unsuccessful matches')
@@ -63,16 +67,26 @@ def get_args():
     parser_filters.add_argument('--skip-albums', '--skip_albums', help="file listing albums to skip", default=DEFAULTS.get('skip_albums'))
 
     args = parser.parse_args()
+    if not 0 <= args.port <= 65535:
+        parser.error('port must be between 0 and 65535')
+    if args.review_artwork and (args.audit_artwork or args.missing_only or args.force or args.clear or args.cleanup or args.test):
+        parser.error('review-artwork cannot be combined with automatic write, audit, or test modes')
     if args.audit_artwork and args.missing_only:
         parser.error('choose audit-artwork or missing-only')
-    if (args.retry_unmatched or args.album_title_fallback or args.artwork_overrides or args.candidate_report) and not args.missing_only:
-        parser.error('retry-unmatched, album-title-fallback, artwork-overrides, and candidate-report require missing-only')
+    if (args.retry_unmatched or args.album_title_fallback or args.artwork_overrides) and not args.missing_only:
+        parser.error('retry-unmatched, album-title-fallback, and artwork-overrides require missing-only')
+    if args.candidate_report and not (args.missing_only or args.review_artwork):
+        parser.error('candidate-report requires missing-only or review-artwork')
     if args.missing_only and (args.force or args.clear or args.cleanup or args.no_skip):
         parser.error('missing-only preserves existing art and cache; incompatible with force, clear, cleanup, no-skip')
     return args
 
 def main():
     args = get_args()
+    if args.review_artwork:
+        from .review_server import launch
+        launch(args)
+        return
     if args.audit_artwork:
         from .artwork_audit import audit_artwork
         audit_artwork(args.path, args.report or 'artwork_audit.csv')
