@@ -26,6 +26,9 @@ class AppleDownloader(object):
         self.request_interval = request_interval
         self._last_request = None
         self._rate_limits = 0
+        self.strict_matching = False
+        self.album_title_fallback = False
+        self.diagnostics = {}
         self.artist_normalizer = ArtistNormalizer()
         self.album_normalizer = AlbumNormalizer()
         self.deromanizer = DeRomanizer()
@@ -35,6 +38,8 @@ class AppleDownloader(object):
             if self._last_request is not None:
                 delay = self.request_interval - (time.monotonic() - self._last_request)
                 if delay > 0:
+                    if self.verbose:
+                        print(f"Waiting {delay:.1f} seconds before the next request...", flush=True)
                     time.sleep(delay)
             try:
                 q = Request(url)
@@ -100,6 +105,9 @@ class AppleDownloader(object):
         elif artist in token:
             query_term = token
         url = QUERY_TEMPLATE % (quote(query_term), entity)
+        self.diagnostics.setdefault('queries', []).append(url)
+        if self.verbose:
+            print(f"Searching Apple: {query_term} ({entity})", flush=True)
         raw_json = self._urlopen_text(url)
         if raw_json:
             info = json.loads(raw_json)
@@ -114,13 +122,46 @@ class AppleDownloader(object):
         info = self._query(artist, album, title)
         if not info or not info.get('resultCount'):
             # no result found, try replacing any roman numerals
-            artist = self.deromanizer.convert_all(artist)
-            album = self.deromanizer.convert_all(album)
-            info = self._query(artist, album, title)
+            converted_artist = self.deromanizer.convert_all(artist)
+            converted_album = self.deromanizer.convert_all(album)
+            if not self.strict_matching or (artist, album) != (converted_artist, converted_album):
+                artist, album = converted_artist, converted_album
+                info = self._query(artist, album, title)
         return (artist, album, info, len(album) == 0)
 
     def download(self, meta: MetaAudio, art_path: str) -> bool:
+        self.diagnostics = {'queries': [], 'candidates': [], 'reason': '', 'status': 'no_match'}
         (meta_artist, meta_album, info, title_only) = self._get_data(meta)
+        if self.strict_matching:
+            matches = {}
+            for candidate in info['results']:
+                artist = self.artist_normalizer.normalize(candidate.get('artistName'))
+                album = self.album_normalizer.normalize(candidate.get('collectionName'))
+                reason = ('missing artist metadata' if not meta_artist else
+                          'artist mismatch' if meta_artist not in artist else
+                          'missing album metadata' if not meta_album else
+                          'album title is not an exact normalized match' if meta_album != album else
+                          'missing artwork URL' if not candidate.get('artworkUrl100') else '')
+                self._record_candidate(candidate, reason or 'exact normalized match')
+                if not reason:
+                    key = candidate.get('collectionId') or candidate['artworkUrl100']
+                    matches[key] = candidate
+            if len(matches) == 1:
+                candidate = next(iter(matches.values()))
+                self._download_from_url(candidate['artworkUrl100'].replace('100x100bb', self.file_suffix), art_path)
+                self.diagnostics.update(status='matched', reason='one exact normalized album match')
+                return True
+            if len(matches) > 1:
+                self.diagnostics.update(status='manual_review', reason='multiple catalog albums match; no cover accepted')
+            else:
+                self.diagnostics['reason'] = 'no candidate passed artist and exact album checks'
+                if self.album_title_fallback and meta_album:
+                    fallback = self._query('', meta_album, '')
+                    for candidate in fallback['results']:
+                        self._record_candidate(candidate, 'album-title fallback: manual review required')
+                    if fallback['results']:
+                        self.diagnostics.update(status='manual_review', reason='album-title candidates require manual review')
+            return False
         if info:
             try:
                 art = ""
@@ -152,3 +193,11 @@ class AppleDownloader(object):
         if self.verbose:
             print(f"Failed to find matching artist ({meta_artist}) and album ({meta_album})")
         return False
+
+    def _record_candidate(self, candidate, reason):
+        detail = {key: candidate.get(key) for key in
+                  ('collectionId', 'collectionName', 'artistName', 'collectionViewUrl', 'artworkUrl100')}
+        detail['reason'] = reason
+        self.diagnostics['candidates'].append(detail)
+        if self.verbose:
+            print(f"Candidate: {detail['collectionName']} / {detail['artistName']}: {reason}")

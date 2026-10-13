@@ -23,6 +23,8 @@ class MetaID3(MetaAudio):
         self.audio.tags.delall("APIC")
 
     def embed_art(self, art_path: str):
+        with open(art_path, 'rb') as artwork:
+            data = artwork.read()
         # from https://stackoverflow.com/questions/409949/how-do-you-embed-album-art-into-an-mp3-using-python
         self.audio.tags.add(
             APIC(
@@ -30,7 +32,7 @@ class MetaID3(MetaAudio):
                 mime = MetaAudio.get_mime_type(art_path),
                 type=3, # 3 is for the cover image
                 desc=u'Cover',
-                data=open(art_path, 'rb').read()
+                data=data
             )
         )
 

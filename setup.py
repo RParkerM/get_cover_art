@@ -26,6 +26,7 @@ setuptools.setup(
     packages = setuptools.find_packages(),
     install_requires = [
         'mutagen',
+        'Pillow', # validate embedded and cached artwork during audit/recovery
     ],
     classifiers = [
         'Development Status :: 4 - Beta',

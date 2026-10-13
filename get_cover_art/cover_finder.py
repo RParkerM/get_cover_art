@@ -1,4 +1,4 @@
-import os, unicodedata, re
+import os, unicodedata, re, json
 from pathlib import Path
 from typing import List, Union
 
@@ -69,6 +69,12 @@ class CoverFinder(object):
         self.albums_skipped = set()
         self.albums_failed = set()
         self.stopped = False
+        self.missing_only = options.get('missing_only', False)
+        self.retry_unmatched = options.get('retry_unmatched', False)
+        self.recovery_rows = []
+        self.recovery_results = {}
+        if self.missing_only and (options.get('force') or options.get('clear') or options.get('cleanup') or options.get('no_skip')):
+            raise ValueError('missing-only cannot be combined with force, clear, cleanup, or no-skip; use retry-unmatched')
 
         self.art_folder_override = ""
         self.verbose = options.get('verbose')
@@ -79,6 +85,8 @@ class CoverFinder(object):
             throttle = float(options.get('throttle', DEFAULTS['throttle']))
             interval = float(options.get('request_interval', DEFAULTS['request_interval']))
             self.downloader = AppleDownloader(self.verbose, throttle, self.art_size, self.art_quality, interval)
+            self.downloader.strict_matching = self.missing_only
+            self.downloader.album_title_fallback = options.get('album_title_fallback', False)
         if not options.get('art_dest_inline'):
             self.art_folder_override = options.get('art_dest')
             if self.art_folder_override:
@@ -122,7 +130,7 @@ class CoverFinder(object):
         else:
             ext = ""
         value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore')
-        value = re.sub('[^\w\s-]', '', bytes.decode(value)).strip()
+        value = re.sub(r'[^\w\s-]', '', bytes.decode(value)).strip()
         value += ext
         return value
     
@@ -162,6 +170,8 @@ class CoverFinder(object):
     def scan_file(self, path: str, allow_cleanup = True):
         if self.stopped:
             return
+        if self.missing_only:
+            return self._recover_file(path)
         art_path = path
         art_folder = self.art_folder_override or os.path.split(path)[0]
         try:
@@ -254,3 +264,90 @@ class CoverFinder(object):
                 if self.stopped:
                     return
         self._cleanup(self.files_to_delete)
+
+    def _recover_file(self, path):
+        from .artwork_audit import inspect_artwork, validate_image
+        from .meta import EXT_TO_CONSTRUCTOR
+        if os.path.splitext(path)[1][1:].lower() not in EXT_TO_CONSTRUCTOR:
+            self.files_invalid.append(path)
+            return
+        row = inspect_artwork(path)
+        if row['status'] == 'embedded':
+            self.files_skipped.append(path)
+            return
+        self.recovery_rows.append(row)
+        row.update(local_cover='', local_cover_available=False, queries='[]', candidates='[]')
+        art_path = path
+        try:
+            if row['status'] != 'missing':
+                row['reason'] = 'existing invalid artwork or unreadable audio requires manual review: ' + row['reason']
+                row['status'] = 'manual_review'
+                self.files_failed.append(path)
+                return
+            meta = get_meta(path)
+            folder = self.art_folder_override or os.path.dirname(path)
+            filename = self._slugify(self.art_dest_filename.format(
+                artist=meta.artist, album=meta.album, title=meta.title,
+                album_or_title=meta.album or meta.title,
+                filename=os.path.splitext(os.path.basename(path))[0]))
+            art_path = os.path.join(folder, filename)
+            row.update(local_cover=art_path, local_cover_available=os.path.isfile(art_path))
+            print(f"Missing artwork: {meta.album} | album artist: {row['album_artist']} | "
+                  f"track artist: {row['track_artist']} | local cover: {row['local_cover_available']}", flush=True)
+            reason = ''
+            if self.ignore_artists.has(meta.artist):
+                reason = 'explicit artist filter'
+            elif self.ignore_albums.has(meta.album):
+                reason = 'explicit album filter'
+            if reason:
+                row.update(status='skipped', reason=reason)
+            elif not os.path.isfile(art_path):
+                if art_path in self.recovery_results:
+                    row.update(self.recovery_results[art_path])
+                elif self.ignore_artwork.has(art_path) and not self.retry_unmatched:
+                    row.update(status='cached_no_match', reason='previous unsuccessful search; use --retry-unmatched to retry')
+                elif not self.downloader:
+                    row.update(status='missing_local_cover', reason='no downloaded cover; no-download prevents requests')
+                else:
+                    try:
+                        success = self.downloader.download(meta, art_path)
+                    finally:
+                        diagnostics = self.downloader.diagnostics
+                        row.update(queries=json.dumps(diagnostics.get('queries', [])),
+                                   candidates=json.dumps(diagnostics.get('candidates', [])))
+                    if success:
+                        self.downloads.add(art_path)
+                    else:
+                        row.update(status=diagnostics['status'], reason=diagnostics['reason'])
+                        if row['status'] == 'no_match':
+                            self.ignore_artwork.add(art_path)
+            if os.path.isfile(art_path) and not reason:
+                with open(art_path, 'rb') as cover:
+                    validate_image(cover.read())
+                if self.embed:
+                    if not meta.embed(art_path):
+                        raise ValueError('Cover could not be embedded')
+                    meta.save()
+                    # Verify the saved file, rather than counting an attempted embed as success.
+                    if inspect_artwork(path)['status'] != 'embedded':
+                        raise ValueError('Saved file has no valid embedded artwork')
+                    row.update(status='embedded', reason='embedded and verified local cover')
+                else:
+                    row.update(status='cover_available', reason='cover ready; test mode leaves audio unchanged')
+                self.files_processed.append(path)
+            else:
+                if row['status'] == 'failed':
+                    self.files_failed.append(path)
+                    self.albums_failed.add(art_path)
+                else:
+                    self.files_skipped.append(path)
+                    self.albums_skipped.add(art_path)
+        except Exception as error:
+            row.update(status='failed', reason=f'{type(error).__name__}: {error}')
+            self.files_failed.append(path)
+            self.albums_failed.add(art_path)
+            if isinstance(error, RateLimitError):
+                self.stopped = True
+        finally:
+            self.recovery_results[art_path] = {key: row.get(key, '') for key in ('status', 'reason', 'queries', 'candidates')}
+            print(f"Artwork outcome: {row['status']}: {row['reason']}", flush=True)

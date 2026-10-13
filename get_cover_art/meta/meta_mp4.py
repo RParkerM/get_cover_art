@@ -17,13 +17,14 @@ class MetaMP4(MetaAudio):
             raise Exception("missing XMP tags")
     
     def has_embedded_art(self) -> bool:
-        return 'covr' in self.audio.tags
+        return bool(self.audio.tags.get('covr'))
 
     def detach_art(self):
         self.audio.tags['covr'] = []
 
     def embed_art(self, art_path: str):
-        artworkfile = open(art_path, 'rb').read()
+        with open(art_path, 'rb') as artwork:
+            artworkfile = artwork.read()
         format = M4ACover.FORMAT_PNG if art_path.endswith('png') else M4ACover.FORMAT_JPEG
         self.audio.tags['covr'] = [M4ACover(artworkfile, format)]
 

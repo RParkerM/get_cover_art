@@ -48,21 +48,44 @@ def get_args():
     parser_behavior.add_argument('--no-skip', '--no_skip', help="don't skip previously-scanned files", action='store_true')
     parser_behavior.add_argument('--throttle', type=check_throttle, help="initial rate-limit backoff in seconds (default: 3)", default=DEFAULTS['throttle'])
     parser_behavior.add_argument('--request-interval', type=check_throttle, help="minimum seconds between requests, including artwork downloads (default: 10)", default=DEFAULTS['request_interval'])
+    parser_behavior.add_argument('--audit-artwork', action='store_true', help='read-only embedded artwork audit; no requests or audio changes')
+    parser_behavior.add_argument('--missing-only', action='store_true', help='recover only tracks without embedded artwork; preserve caches and existing art')
+    parser_behavior.add_argument('--retry-unmatched', action='store_true', help='with missing-only, explicitly retry cached unsuccessful matches')
+    parser_behavior.add_argument('--album-title-fallback', action='store_true', help='with missing-only, search album title for manual-review candidates only')
+    parser_behavior.add_argument('--report', help='CSV destination (default: artwork_audit.csv or artwork_recovery.csv)')
 
     parser_filters = parser.add_argument_group('filter options')
     parser_filters.add_argument('--skip-artwork', '--skip_artwork', help="(maintained between runs) file listing destination art files to skip", default=DEFAULTS.get('skip_artwork'))
     parser_filters.add_argument('--skip-artists', '--skip_artists', help="file listing artists to skip", default=DEFAULTS.get('skip_artists'))
     parser_filters.add_argument('--skip-albums', '--skip_albums', help="file listing albums to skip", default=DEFAULTS.get('skip_albums'))
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.audit_artwork and args.missing_only:
+        parser.error('choose audit-artwork or missing-only')
+    if (args.retry_unmatched or args.album_title_fallback) and not args.missing_only:
+        parser.error('retry-unmatched and album-title-fallback require missing-only')
+    if args.missing_only and (args.force or args.clear or args.cleanup or args.no_skip):
+        parser.error('missing-only preserves existing art and cache; incompatible with force, clear, cleanup, no-skip')
+    return args
 
 def main():
     args = get_args()
+    if args.audit_artwork:
+        from .artwork_audit import audit_artwork
+        audit_artwork(args.path, args.report or 'artwork_audit.csv')
+        return
     finder = CoverFinder(vars(args))
-    if os.path.isfile(args.path):
-        finder.scan_file(args.path)
-    else:
-        finder.scan_folder(args.path)
+    try:
+        if os.path.isfile(args.path):
+            finder.scan_file(args.path)
+        else:
+            finder.scan_folder(args.path)
+    finally:
+        if args.missing_only:
+            from .artwork_audit import write_report
+            destination = args.report or 'artwork_recovery.csv'
+            write_report(finder.recovery_rows, destination)
+            print(f'Recovery report: {destination}')
     print()
     num_processed = len(finder.files_processed)
     num_skipped = len(finder.files_skipped)
