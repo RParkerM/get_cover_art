@@ -73,6 +73,8 @@ class CoverFinder(object):
         self.retry_unmatched = options.get('retry_unmatched', False)
         self.recovery_rows = []
         self.recovery_results = {}
+        from .artwork_review import ManualOverrides
+        self.manual_overrides = ManualOverrides(options.get('artwork_overrides'))
         if self.missing_only and (options.get('force') or options.get('clear') or options.get('cleanup') or options.get('no_skip')):
             raise ValueError('missing-only cannot be combined with force, clear, cleanup, or no-skip; use retry-unmatched')
 
@@ -171,7 +173,12 @@ class CoverFinder(object):
         if self.stopped:
             return
         if self.missing_only:
-            return self._recover_file(path)
+            start = len(self.recovery_rows)
+            self._recover_file(path)
+            if allow_cleanup:
+                from .artwork_review import print_album_summaries
+                print_album_summaries(self.recovery_rows[start:])
+            return
         art_path = path
         art_folder = self.art_folder_override or os.path.split(path)[0]
         try:
@@ -258,11 +265,17 @@ class CoverFinder(object):
         self.files_to_delete = set([])
         if self.verbose: print(f"Scanning folder: {folder}")
         for root, dirs, files in os.walk(folder):
-            for f in sorted(files):
-                path = os.path.join(root, f)
-                self.scan_file(path, False)
-                if self.stopped:
-                    return
+            start = len(self.recovery_rows)
+            try:
+                for f in sorted(files):
+                    path = os.path.join(root, f)
+                    self.scan_file(path, False)
+                    if self.stopped:
+                        return
+            finally:
+                if self.missing_only:
+                    from .artwork_review import print_album_summaries
+                    print_album_summaries(self.recovery_rows[start:])
         self._cleanup(self.files_to_delete)
 
     def _recover_file(self, path):
@@ -291,9 +304,10 @@ class CoverFinder(object):
                 album_or_title=meta.album or meta.title,
                 filename=os.path.splitext(os.path.basename(path))[0]))
             art_path = os.path.join(folder, filename)
+            approval = self.manual_overrides.find(row)
+            if approval:
+                art_path = self.manual_overrides.cover_path(approval, art_path)
             row.update(local_cover=art_path, local_cover_available=os.path.isfile(art_path))
-            print(f"Missing artwork: {meta.album} | album artist: {row['album_artist']} | "
-                  f"track artist: {row['track_artist']} | local cover: {row['local_cover_available']}", flush=True)
             reason = ''
             if self.ignore_artists.has(meta.artist):
                 reason = 'explicit artist filter'
@@ -304,13 +318,16 @@ class CoverFinder(object):
             elif not os.path.isfile(art_path):
                 if art_path in self.recovery_results:
                     row.update(self.recovery_results[art_path])
-                elif self.ignore_artwork.has(art_path) and not self.retry_unmatched:
+                elif approval and approval.get('local_artwork'):
+                    row.update(status='missing_local_cover', reason='approved local artwork file is missing; no catalog search performed')
+                elif not approval and self.ignore_artwork.has(art_path) and not self.retry_unmatched:
                     row.update(status='cached_no_match', reason='previous unsuccessful search; use --retry-unmatched to retry')
                 elif not self.downloader:
                     row.update(status='missing_local_cover', reason='no downloaded cover; no-download prevents requests')
                 else:
                     try:
-                        success = self.downloader.download(meta, art_path)
+                        success = (self.downloader.download_approved(approval, art_path) if approval else
+                                   self.downloader.download(meta, art_path))
                     finally:
                         diagnostics = self.downloader.diagnostics
                         row.update(queries=json.dumps(diagnostics.get('queries', [])),
@@ -325,6 +342,7 @@ class CoverFinder(object):
                 with open(art_path, 'rb') as cover:
                     validate_image(cover.read())
                 if self.embed:
+                    meta.quiet = True
                     if not meta.embed(art_path):
                         raise ValueError('Cover could not be embedded')
                     meta.save()
@@ -350,4 +368,3 @@ class CoverFinder(object):
                 self.stopped = True
         finally:
             self.recovery_results[art_path] = {key: row.get(key, '') for key in ('status', 'reason', 'queries', 'candidates')}
-            print(f"Artwork outcome: {row['status']}: {row['reason']}", flush=True)

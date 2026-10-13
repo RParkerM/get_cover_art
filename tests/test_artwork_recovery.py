@@ -15,6 +15,7 @@ from mutagen.id3 import APIC, TALB, TIT2, TPE1, TPE2
 from get_cover_art.artwork_audit import audit_artwork, inspect_artwork
 from get_cover_art.cover_finder import CoverFinder
 from get_cover_art.__main__ import main
+from get_cover_art.artwork_review import ManualOverrides, write_candidates
 
 
 class RecoveryTests(unittest.TestCase):
@@ -239,6 +240,173 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(finder.recovery_rows[0]['status'], 'failed')
         self.assertEqual(self.digest(path), before)
         self.http.assert_not_called()
+
+    def overrides(self, **entry):
+        destination = os.path.join(self.root, 'approvals.csv')
+        with open(destination, 'w', encoding='utf-8-sig', newline='') as output:
+            writer = csv.DictWriter(output, fieldnames=['local_folder', 'local_album', 'local_artist',
+                                                       'collection_id', 'artwork_url', 'local_artwork'])
+            writer.writeheader()
+            writer.writerow(entry)
+        return destination
+
+    def test_repeated_tracks_log_one_album_and_export_candidates_once(self):
+        self.track('Missing', 'one')
+        self.track('Missing', 'two')
+        self.http.side_effect = [self.response([self.candidate('Missing Deluxe Edition')])]
+        finder = self.finder()
+        with patch('builtins.print') as log:
+            finder.scan_folder(self.root)
+        summaries = [call for call in log.call_args_list if str(call.args[0]).startswith('Album:')]
+        self.assertEqual(len(summaries), 1)
+        self.assertIn('2 affected tracks', summaries[0].args[0])
+        self.assertFalse(any('Missing artwork:' in str(call) or 'Artwork outcome:' in str(call) for call in log.call_args_list))
+        self.assertEqual(self.http.call_count, 1)
+        report = os.path.join(self.root, 'candidates.csv')
+        write_candidates(finder.recovery_rows, report)
+        with open(report, encoding='utf-8-sig', newline='') as output:
+            candidates = list(csv.DictReader(output))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]['track_count'], '2')
+        self.assertEqual(candidates[0]['collection_id'], '1')
+        self.assertIn('exact normalized', candidates[0]['rejection_reason'])
+        self.assertIn('itunes.apple.com/search', candidates[0]['query'])
+
+    def test_alternate_editions_and_casts_are_not_accepted(self):
+        cases = [('Show', 'Show Deluxe Edition', 'Artist'),
+                 ('Show (Original Cast)', 'Show (Revival Cast)', 'Artist'),
+                 ('Show (Disc 1)', 'Show', 'Artist'),
+                 ('Show', 'Show', 'Artist and Revival Cast')]
+        for local, catalog, artist in cases:
+            with self.subTest(local=local, catalog=catalog, artist=artist):
+                path = self.track(local, 'one')
+                self.http.side_effect = [self.response([self.candidate(catalog, artist)])]
+                finder = self.finder(retry_unmatched=True)
+                finder.scan_file(path)
+                self.assertEqual(finder.recovery_rows[0]['status'], 'no_match')
+                self.assertEqual(inspect_artwork(path)['status'], 'missing')
+                self.assertEqual(len(json.loads(finder.recovery_rows[0]['candidates'])), 1)
+
+    def test_artist_misspelling_fallback_is_review_only(self):
+        path = self.track('Show', 'one')
+        self.http.side_effect = [self.response([self.candidate('Show', 'Artits')]),
+                                 self.response([self.candidate('Show', 'Artist')])]
+        finder = self.finder(album_title_fallback=True)
+        finder.scan_file(path)
+        self.assertEqual(finder.recovery_rows[0]['status'], 'manual_review')
+        self.assertEqual(self.http.call_count, 2)
+        self.assertEqual(inspect_artwork(path)['status'], 'missing')
+
+    def test_compilation_uses_album_artist_and_downloads_once(self):
+        paths = [self.track('Compilation', name) for name in ('one', 'two')]
+        for index, path in enumerate(paths):
+            audio = WAVE(path)
+            audio.tags.add(TPE2(text=['Various Artists']))
+            audio.tags.add(TPE1(text=['Performer ' + str(index)]))
+            audio.save()
+        self.http.side_effect = [self.response([self.candidate('Compilation', 'Various Artists')]), io.BytesIO(self.jpeg)]
+        finder = self.finder()
+        with patch('builtins.print') as log:
+            finder.scan_folder(self.root)
+        self.assertEqual(self.http.call_count, 2)
+        self.assertTrue(all(inspect_artwork(path)['status'] == 'embedded' for path in paths))
+        self.assertEqual(sum(str(call.args[0]).startswith('Album:') for call in log.call_args_list), 1)
+
+    def test_approved_collection_id_lookup_and_offline_reuse(self):
+        path = self.track('Show', 'one')
+        approval_file = self.overrides(local_album='Show', local_artist='Artist', collection_id='42')
+        candidate = self.candidate('Different Approved Recording', 'Cast', 42)
+        candidate['wrapperType'] = 'collection'
+        self.http.side_effect = [self.response([candidate]), io.BytesIO(self.jpeg)]
+        finder = self.finder(artwork_overrides=approval_file, test=True)
+        finder.scan_file(path)
+        self.assertEqual(self.http.call_count, 2)
+        self.assertIn('/lookup?id=42', self.http.call_args_list[0].args[0].full_url)
+        self.assertTrue(os.path.isfile(finder.recovery_rows[0]['local_cover']))
+        self.assertIn('.apple-42.jpg', finder.recovery_rows[0]['local_cover'])
+        self.http.reset_mock()
+        offline = self.finder(artwork_overrides=approval_file, no_download=True)
+        offline.scan_file(path)
+        self.http.assert_not_called()
+        self.assertEqual(inspect_artwork(path)['status'], 'embedded')
+
+    def test_approved_url_bypasses_search_and_preserves_old_cover(self):
+        path = self.track('Show', 'one')
+        old_cover = self.cover('Show')
+        old_digest = self.digest(old_cover)
+        url = 'https://example.com/approved.jpg'
+        approval_file = self.overrides(local_folder=os.path.dirname(path), artwork_url=url)
+        self.http.side_effect = [io.BytesIO(self.jpeg)]
+        finder = self.finder(artwork_overrides=approval_file)
+        finder.scan_file(path)
+        self.assertEqual(self.http.call_count, 1)
+        self.assertEqual(self.http.call_args.args[0].full_url, url)
+        self.assertIn('.url-', finder.recovery_rows[0]['local_cover'])
+        self.assertEqual(self.digest(old_cover), old_digest)
+
+    def test_approved_local_image_applies_offline(self):
+        path = self.track('Show', 'one')
+        image = self.cover('Approved')
+        approval_file = self.overrides(local_folder=os.path.dirname(path), local_artwork=os.path.basename(image))
+        finder = self.finder(artwork_overrides=approval_file, no_download=True)
+        finder.scan_file(path)
+        self.assertEqual(inspect_artwork(path)['status'], 'embedded')
+        self.http.assert_not_called()
+
+    def test_offline_id_without_cached_image_makes_no_requests(self):
+        path = self.track('Show', 'one')
+        approval_file = self.overrides(local_folder=os.path.dirname(path), collection_id='42')
+        self.cover('Show')  # This unapproved old cover must not stand in for approved ID 42.
+        finder = self.finder(artwork_overrides=approval_file, no_download=True)
+        finder.scan_file(path)
+        self.assertEqual(finder.recovery_rows[0]['status'], 'missing_local_cover')
+        self.assertEqual(inspect_artwork(path)['status'], 'missing')
+        self.http.assert_not_called()
+
+    def test_bad_or_conflicting_approvals_fail_without_requests(self):
+        filename = self.overrides(local_album='Show', local_artist='Artist', collection_id='invalid')
+        with self.assertRaises(ValueError):
+            ManualOverrides(filename)
+        filename = self.overrides(local_album='Show', local_artist='Artist', collection_id='42', artwork_url='https://example.com/art.jpg')
+        with self.assertRaises(ValueError):
+            ManualOverrides(filename)
+        self.http.assert_not_called()
+
+    def test_approval_rate_limit_still_stops_after_three(self):
+        path = self.track('Show', 'one')
+        filename = self.overrides(local_album='Show', local_artist='Artist', collection_id='42')
+        self.http.side_effect = [HTTPError('https://itunes.apple.com/lookup', 429, 'limited', {}, None) for _ in range(3)]
+        finder = self.finder(artwork_overrides=filename)
+        finder.scan_file(path)
+        self.assertTrue(finder.stopped)
+        self.assertEqual(self.http.call_count, 3)
+
+    def test_lookup_rejects_unapproved_id(self):
+        path = self.track('Show', 'one')
+        filename = self.overrides(local_album='Show', local_artist='Artist', collection_id='42')
+        candidate = self.candidate('Show', identity=43)
+        candidate['wrapperType'] = 'collection'
+        self.http.side_effect = [self.response([candidate])]
+        finder = self.finder(artwork_overrides=filename)
+        finder.scan_file(path)
+        self.assertEqual(finder.recovery_rows[0]['status'], 'failed')
+        self.assertEqual(self.http.call_count, 1)
+        self.assertEqual(inspect_artwork(path)['status'], 'missing')
+
+    def test_cli_writes_per_file_and_candidate_reports(self):
+        self.track('Show', 'one')
+        self.track('Show', 'two')
+        report = os.path.join(self.root, 'recovery.csv')
+        candidates = os.path.join(self.root, 'candidates.csv')
+        self.http.side_effect = [self.response([self.candidate('Show Deluxe')])]
+        with patch('sys.argv', ['get_cover_art', '--path', self.root, '--missing-only',
+                               '--art-dest', self.root, '--skip-artwork', self.cache,
+                               '--report', report, '--candidate-report', candidates]):
+            main()
+        with open(report, encoding='utf-8-sig', newline='') as source:
+            self.assertEqual(len(list(csv.DictReader(source))), 2)
+        with open(candidates, encoding='utf-8-sig', newline='') as source:
+            self.assertEqual(len(list(csv.DictReader(source))), 1)
 
 
 if __name__ == '__main__':

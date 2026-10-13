@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import unicodedata
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 from urllib.request import Request, urlopen, HTTPError
@@ -11,6 +12,7 @@ from .deromanizer import DeRomanizer
 from .meta import MetaAudio
 
 QUERY_TEMPLATE = "https://itunes.apple.com/search?term=%s&media=music&entity=%s"
+LOOKUP_TEMPLATE = "https://itunes.apple.com/lookup?id=%s&entity=album"
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.55 Safari/537.36"
 THROTTLED_HTTP_CODES = [403, 429]
 
@@ -138,9 +140,10 @@ class AppleDownloader(object):
                 artist = self.artist_normalizer.normalize(candidate.get('artistName'))
                 album = self.album_normalizer.normalize(candidate.get('collectionName'))
                 reason = ('missing artist metadata' if not meta_artist else
-                          'artist mismatch' if meta_artist not in artist else
+                          'artist mismatch' if meta_artist != artist else
                           'missing album metadata' if not meta_album else
                           'album title is not an exact normalized match' if meta_album != album else
+                          'recording or edition wording differs' if self._recording_title(meta.album) != self._recording_title(candidate.get('collectionName', '')) else
                           'missing artwork URL' if not candidate.get('artworkUrl100') else '')
                 self._record_candidate(candidate, reason or 'exact normalized match')
                 if not reason:
@@ -153,6 +156,9 @@ class AppleDownloader(object):
                 return True
             if len(matches) > 1:
                 self.diagnostics.update(status='manual_review', reason='multiple catalog albums match; no cover accepted')
+                for detail in self.diagnostics['candidates']:
+                    if detail['reason'] == 'exact normalized match':
+                        detail['reason'] = 'ambiguous: multiple distinct catalog albums match'
             else:
                 self.diagnostics['reason'] = 'no candidate passed artist and exact album checks'
                 if self.album_title_fallback and meta_album:
@@ -198,6 +204,29 @@ class AppleDownloader(object):
         detail = {key: candidate.get(key) for key in
                   ('collectionId', 'collectionName', 'artistName', 'collectionViewUrl', 'artworkUrl100')}
         detail['reason'] = reason
+        detail['query'] = (self.diagnostics.get('queries') or [''])[-1]
         self.diagnostics['candidates'].append(detail)
-        if self.verbose:
+        if self.verbose and not self.strict_matching:
             print(f"Candidate: {detail['collectionName']} / {detail['artistName']}: {reason}")
+
+    @staticmethod
+    def _recording_title(title):
+        # Keep all edition, cast, and disc wording; only normalize Unicode/case/spacing.
+        return ' '.join(unicodedata.normalize('NFKC', title or '').casefold().split())
+
+    def download_approved(self, approval, art_path):
+        self.diagnostics = {'queries': [], 'candidates': [], 'status': 'approved', 'reason': 'explicit manual approval'}
+        url = approval.get('artwork_url')
+        if approval.get('collection_id'):
+            lookup = LOOKUP_TEMPLATE % approval['collection_id']
+            self.diagnostics['queries'].append(lookup)
+            info = json.loads(self._urlopen_text(lookup))
+            candidates = [candidate for candidate in info.get('results', [])
+                          if str(candidate.get('collectionId')) == approval['collection_id']
+                          and candidate.get('wrapperType') == 'collection' and candidate.get('artworkUrl100')]
+            if len(candidates) != 1:
+                raise ValueError('Approved collection ID did not resolve to exactly one album with artwork')
+            self._record_candidate(candidates[0], 'explicitly approved collection ID')
+            url = candidates[0]['artworkUrl100'].replace('100x100bb', self.file_suffix)
+        self._download_from_url(url, art_path)
+        return True

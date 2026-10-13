@@ -53,6 +53,8 @@ def get_args():
     parser_behavior.add_argument('--retry-unmatched', action='store_true', help='with missing-only, explicitly retry cached unsuccessful matches')
     parser_behavior.add_argument('--album-title-fallback', action='store_true', help='with missing-only, search album title for manual-review candidates only')
     parser_behavior.add_argument('--report', help='CSV destination (default: artwork_audit.csv or artwork_recovery.csv)')
+    parser_behavior.add_argument('--candidate-report', help='candidate review CSV (default: artwork_candidates.csv with missing-only)')
+    parser_behavior.add_argument('--artwork-overrides', help='manual approval CSV for missing-only recovery')
 
     parser_filters = parser.add_argument_group('filter options')
     parser_filters.add_argument('--skip-artwork', '--skip_artwork', help="(maintained between runs) file listing destination art files to skip", default=DEFAULTS.get('skip_artwork'))
@@ -62,8 +64,8 @@ def get_args():
     args = parser.parse_args()
     if args.audit_artwork and args.missing_only:
         parser.error('choose audit-artwork or missing-only')
-    if (args.retry_unmatched or args.album_title_fallback) and not args.missing_only:
-        parser.error('retry-unmatched and album-title-fallback require missing-only')
+    if (args.retry_unmatched or args.album_title_fallback or args.artwork_overrides or args.candidate_report) and not args.missing_only:
+        parser.error('retry-unmatched, album-title-fallback, artwork-overrides, and candidate-report require missing-only')
     if args.missing_only and (args.force or args.clear or args.cleanup or args.no_skip):
         parser.error('missing-only preserves existing art and cache; incompatible with force, clear, cleanup, no-skip')
     return args
@@ -86,6 +88,10 @@ def main():
             destination = args.report or 'artwork_recovery.csv'
             write_report(finder.recovery_rows, destination)
             print(f'Recovery report: {destination}')
+            from .artwork_review import write_candidates
+            candidates = args.candidate_report or 'artwork_candidates.csv'
+            write_candidates(finder.recovery_rows, candidates)
+            print(f'Candidate review report: {candidates}')
     print()
     num_processed = len(finder.files_processed)
     num_skipped = len(finder.files_skipped)

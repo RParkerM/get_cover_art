@@ -203,8 +203,9 @@ one run. Recovery retains the pacing, backoff, and three-rejection stop behavior
 After a stop, the report covers only tracks reached; rerun the audit to identify
 everything still missing. Recovery reports are also written when interrupted.
 
-Targeted recovery accepts only one catalog album passing the artist check and
-an exact normalized album-title match. Multiple distinct matching catalog
+Targeted recovery accepts only one catalog album with an exact normalized
+artist match and an album title matching Unicode-normalized case and spacing.
+Edition, cast, recording, and disc wording is preserved. Multiple distinct matching catalog
 albums are reported for manual review without downloading or caching a miss.
 For soundtracks/cast albums, add `--album-title-fallback` to explicitly permit
 an extra album-title-only search after normal matching fails. Those candidates
@@ -218,6 +219,76 @@ or incorrect older matches, since image validation cannot confirm album identity
 preserve existing artwork and the skip cache. Normal scanning remains available
 with its previous matching behavior. Re-run the audit after recovery to measure
 the remaining gaps; a successful run does not guarantee catalog availability.
+
+### Album summaries, candidate review, and manual approvals
+
+Missing-only scans print one summary for each local album (folder, album title,
+and preferred album artist), with affected track count, actual search/lookup
+URLs, candidates and reasons, and outcome counts. Summaries appear after each
+containing folder, or when its scan stops on rate limiting or is interrupted. Search and
+pacing messages still appear during a verbose run. The per-file recovery CSV
+remains available; the additional `artwork_candidates.csv` provides separate
+rows with `local_folder`, `local_album`, `local_artist`, `track_count`,
+`outcome`, `candidate_title`, `candidate_artist`, `artwork_url`, `collection_id`,
+`collection_url`, `rejection_reason`, and `query`. Repeated tracks do not
+duplicate candidate rows. Set another destination with `--candidate-report`.
+No-match searches remain cached; use `--retry-unmatched` to retry them.
+Ambiguous matches and title-only fallback candidates require review and do not
+become cached no-matches. Similar titles or artist substrings alone are never
+accepted automatically in missing-only mode; normal scanning is unchanged.
+
+For example, download conservative matches and collect fallback candidates
+without embedding:
+
+```powershell
+.\.venv\Scripts\python.exe -m get_cover_art --path "C:\Parker\Development\Music library copy\Music" --art-dest "C:\Parker\Development\Apple Music Covers\_cover_art" --missing-only --retry-unmatched --album-title-fallback --test --request-interval 5 --verbose --candidate-report artwork_candidates.csv
+```
+
+Create a user-maintained approval CSV with this header:
+
+```csv
+local_folder,local_album,local_artist,collection_id,artwork_url,local_artwork
+```
+
+Identify each local album with either its `local_folder` or both `local_album`
+and `local_artist` (copy these values from the candidate report). Optional
+additional identity columns narrow the match; album and artist strings must
+match the local metadata exactly. Specify exactly **one** approval target per
+row: the reviewed Apple `collection_id`, an HTTPS `artwork_url`, or a
+`local_artwork` image path. Relative folder/image paths resolve against the
+approval CSV's directory. Conflicting matches are reported as failures.
+
+Example using an already reviewed local image, fully offline:
+
+```csv
+local_folder,local_album,local_artist,collection_id,artwork_url,local_artwork
+C:\Parker\Development\Music library copy\Music\Reviewed Cast Album,,,,,C:\Parker\Development\Apple Music Covers\approved-cast-cover.jpg
+```
+
+To download approved IDs/URLs without embedding:
+
+```powershell
+.\.venv\Scripts\python.exe -m get_cover_art --path "C:\Parker\Development\Music library copy\Music" --art-dest "C:\Parker\Development\Apple Music Covers\_cover_art" --missing-only --artwork-overrides artwork_approvals.csv --test --request-interval 5 --verbose
+```
+
+Approvals bypass unsuccessful-search cache entries but respect artist/album
+filters and existing embedded artwork. IDs use a lookup for that exact album;
+approved URLs download directly without a search. Both use the existing pacing,
+backoff, and three-rejection stop. Downloaded approval files include an Apple
+ID or URL digest in their filenames, keeping them separate from old default
+covers. Changing an approval therefore cannot silently reuse a different
+edition's default cover. Keep the approval CSV when applying these images.
+
+Apply approved images and ordinary downloaded covers with no requests:
+
+```powershell
+.\.venv\Scripts\python.exe -m get_cover_art --path "C:\Parker\Development\Music library copy\Music" --art-dest "C:\Parker\Development\Apple Music Covers\_cover_art" --missing-only --artwork-overrides artwork_approvals.csv --no-download
+```
+
+An ID or URL approval alone cannot operate offline until its image has been
+downloaded; missing images are reported without any lookup or request. For an
+existing image under any filename, use `local_artwork`. CSV reports cover only
+affected tracks reached during the run; re-audit afterward to verify coverage.
 
 ## How it works
 1. First, it recursively scans your provided folder for supported files.

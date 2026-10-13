@@ -8,7 +8,8 @@ class MetaAudio(object):
         
     def embed(self, art_path: str, detach_existing = True) -> bool:
         if os.path.exists(art_path):
-            print(f"Embedding art into {self.audio_path}")
+            if not getattr(self, 'quiet', False):
+                print(f"Embedding art into {self.audio_path}")
             if detach_existing and self.has_embedded_art():
                 self.detach_art()
             self.embed_art(art_path)
